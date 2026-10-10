@@ -1,0 +1,7 @@
+# requirements.txt — GameGuard AI
+
+# This demo is STDLIB-ONLY. It uses nothing but the Python standard library
+# (random, dataclasses, typing). There is intentionally nothing to install:
+# no pip packages, no API keys, no network calls, fully offline.
+#
+# Run it with:  python3 demo.py
