@@ -47,6 +47,19 @@ Determinism: two runs byte-identical.
 | 19 | "free " × 500 (lure-only spam) | no escalation ✓ (lure capped at 0.6) |
 | 20 | "free gems password " × 200 | ESCALATE scam ✓ |
 
+## Violent-threat battery (added Oct 10 — toxicity signal was a stub at 0.0, never scored)
+Two-tier design: bare violent language = likely in-game trash talk (logged, P4, no escalation);
+violent language + real-world credibility anchors = escalate P2 to trust & safety (4h).
+| input | toxicity | verdict |
+| "i will kill you" | 0.35 | no escalation — logged ✓ |
+| "i will kill you in ranked noob lol" | 0.17 | dampened (gaming context) ✓ |
+| "k1ll you" (leetspeak) | 0.35 | normalized, logged ✓ |
+| "gg, i will kill you next round" | 0.35 | in-game framing, logged ✓ |
+| "i will kill you. i know where you live" | 1.00 | ESCALATE → trust & safety, 4h ✓ |
+| "i will kill you tomorrow at school" | 1.00 | ESCALATE → trust & safety, 4h ✓ |
+| "bring a knife tomorrow, i will find you" | 1.00 | ESCALATE → trust & safety, 4h ✓ |
+Regression: demo1/2/3 canned outputs unchanged; lure-alone still P4; determinism holds.
+
 ## False positives found and fixed (2, during tuning)
 1. "don't fall for the free gems password scam guys" escalated at 0.80 →
    warning-context dampening (×0.4) → 0.32, no escalation.

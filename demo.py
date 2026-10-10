@@ -63,7 +63,8 @@ POLICIES = {
     "CRED-02": ("Credential Harvesting", "Asking for passwords, 2FA codes, or login tokens."),
     "CS-01": ("Child Safety: Contact Seeking", "Repeated personal-info requests, secrecy, or moving a minor off-platform."),
     "FRAUD-03": ("Marketplace Fraud", "Deceiving players in trades or charging for 'free' official items."),
-    "TOX-09": ("Toxicity", "Harassment, slurs, threats."),
+    "TOX-09": ("Toxicity & Violent Threats", "Bare trash talk is logged, not escalated; "
+               "violent language WITH real-world credibility anchors escalates to trust & safety."),
 }
 
 ACCOUNT_DB = {
@@ -225,8 +226,37 @@ def classify_message(text: str, language: str, conversation_history: Optional[Li
                + hits(secrecy_markers, combined, combined_n) * 0.35
                + hits(offplat_markers, combined, combined_n) * 0.35)
 
+    # Violent threats are two-tier by design. Bare violent language
+    # ("i will kill you") is overwhelmingly in-game trash talk -- flagging
+    # every instance would drown moderators in false positives, the exact
+    # failure this demo teaches against. It scores low: logged, not escalated.
+    # It becomes actionable only with real-world credibility anchors
+    # ("i know where you live", a school, a weapon, "tomorrow"), which push
+    # it over the escalation threshold for the trust & safety team.
+    threat_markers = ["kill you", "kill u", "murder", "stab", "shoot",
+                      "beat you", "beat u", "kys", "kill yourself",
+                      "hurt you", "hurt u", "strangle", "choke you",
+                      "slit", "i'll end you", "ill end you"]
+    credible_markers = ["i know where you live", "know where you live",
+                        "your address", "ur address", "come to your",
+                        "coming to your", "at school", "tomorrow",
+                        "watch your back", "in real life", "irl",
+                        "gun", "knife", "find you", "outside your house",
+                        "your house"]
+    # In-game context dampens: "kill you in ranked" is trash talk, not a threat.
+    game_markers = ["in game", "in the game", "in ranked", "noob", "1v1",
+                    "rematch", "respawn", " gg", "lol", "lmao", "clutch",
+                    "camping", "tryhard"]
+    threat = hits(threat_markers, t, tn)
+    cred = hits(credible_markers, combined, combined_n)
+    toxicity = min(1.0, threat * 0.35 + cred * 0.45)
+    if threat and hits(game_markers, t, tn):
+        toxicity *= 0.5  # gaming-context dampener (anti-false-positive layer)
+        _log("classify_message", {"context": "gaming"},
+             "in-game markers present; threat score dampened (trash talk, not a real-world threat)")
+
     scores = {"scam": scam, "marketplace_fraud": fraud,
-              "child_safety_risk": risk, "toxicity": 0.0}
+              "child_safety_risk": risk, "toxicity": round(toxicity, 2)}
     _log("classify_message", {"lang": language, "text": text[:36]},
          f"scores={ {k: round(v, 2) for k, v in scores.items()} }")
     return {"scores": scores, "language": language,
@@ -268,7 +298,8 @@ def retrieve_safety_policy(signal: str) -> Dict:
     return {"policy_id": key, "title": title, "description": desc}
 
 
-def calculate_case_priority(scores: Dict, acct: Dict, pattern_length: int) -> Dict:
+def calculate_case_priority(scores: Dict, acct: Dict, pattern_length: int,
+                            primary: Optional[str] = None) -> Dict:
     base = max(scores.values())
     if scores.get("child_safety_risk", 0) >= 0.5:
         band, eta = "P1-CRITICAL", "trained child-safety specialist, review within 1 hour"
@@ -278,6 +309,9 @@ def calculate_case_priority(scores: Dict, acct: Dict, pattern_length: int) -> Di
         band, eta = "P3-MEDIUM", "general moderation queue, review within 72 hours"
     else:
         band, eta = "P4-LOW", "no escalation; logged for pattern tracking"
+    if primary == "toxicity" and band == "P2-HIGH":
+        # a credible violent threat is not fraud -- route to the right humans
+        eta = "trust & safety team, review within 4 hours"
     _log("calculate_case_priority", {"max_score": round(base, 2), "pattern_len": pattern_length},
          f"priority={band}")
     return {"priority": band, "routed_to": eta}
@@ -381,7 +415,7 @@ class GameGuardAgent:
             pol_key = {"scam": "scam", "marketplace_fraud": "marketplace_fraud",
                        "child_safety_risk": "child_safety", "toxicity": "toxicity"}[primary]
             policy = retrieve_safety_policy(pol_key)
-            prio = calculate_case_priority(agg, acct, pattern_len)
+            prio = calculate_case_priority(agg, acct, pattern_len, primary=primary)
             if prio["priority"] != "P4-LOW":
                 evidence = [f"[{m['ts']}] {player}: {m['original']!r}"
                             for m in self.memory[key][-4:]]
