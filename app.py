@@ -1,320 +1,143 @@
 #!/usr/bin/env python3
-"""
-GameGuard AI — localhost web UI
-================================
-Run this and open the printed URL in Google Chrome:
+"""GameGuard AI -- localhost web UI (stdlib only).
 
-    python3 app.py
-    # Open in Chrome: http://localhost:8007
-
-Stdlib only (http.server + subprocess + json). No Flask, no Streamlit, no pip,
-no internet, no API keys. The demo itself is executed by running demo.py in a
-subprocess, so demo.py's behavior is untouched.
+Run:  python3 app.py   then open http://localhost:8007
+Serves a guided, personalized tour of demo.py (the tested artifact --
+demo.py is never modified here; it is only imported as a module and its
+canned subprocess run is unchanged).
 """
 
-import errno
+import contextlib
 import http.server
+import io
 import json
-import os
+import re
 import subprocess
 import sys
+import urllib.parse
+from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8007
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+HERE = Path(__file__).resolve().parent
+DEMO_PY = HERE / "demo.py"
 
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GameGuard AI — Live Demo</title>
-<style>
-  :root{
-    --bg:#0e1116; --panel:#161b22; --panel2:#1c232e; --line:#2b3442;
-    --ink:#e8edf3; --muted:#9aa4b2; --accent:#58a6ff; --gold:#e3b341;
-    --green:#3fb950; --teal:#39c5cf; --red:#f85149; --violet:#bc8cff;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);
-       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-       line-height:1.55}
-  .wrap{max-width:1100px;margin:0 auto;padding:0 20px 60px}
-  header.hero{padding:38px 0 18px;border-bottom:1px solid var(--line)}
-  header.hero h1{margin:0;font-size:2rem;letter-spacing:-0.5px}
-  header.hero h1 .gg{color:var(--gold)}
-  header.hero p.tag{margin:8px 0 0;color:var(--muted);font-size:1.02rem}
-  .badge{display:inline-block;margin-top:10px;padding:3px 10px;border:1px solid var(--line);
-         border-radius:999px;font-size:.78rem;color:var(--muted);background:var(--panel)}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-        padding:20px 22px;margin-top:20px}
-  .card h2{margin:0 0 8px;font-size:1.12rem;color:var(--accent)}
-  .story p{margin:.55em 0;color:#cdd6e0}
-  .story strong{color:var(--gold)}
-  .controls{display:flex;align-items:center;gap:14px;margin-top:20px}
-  button#run{background:var(--gold);border:0;color:#1a1405;font-weight:700;font-size:1rem;
-             padding:12px 26px;border-radius:8px;cursor:pointer}
-  button#run:hover:not(:disabled){filter:brightness(1.08)}
-  button#run:disabled{opacity:.55;cursor:default}
-  .spinner{display:none;width:22px;height:22px;border:3px solid var(--line);
-           border-top:3px solid var(--gold);border-radius:50%;animation:spin .8s linear infinite}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .status{color:var(--muted);font-size:.92rem;min-height:1.4em}
-  .panels{display:none;margin-top:22px}
-  .panels.show{display:block}
-  .trace{max-height:520px;overflow:auto;background:#0b0e12;border:1px solid var(--line);
-         border-radius:8px;padding:14px 16px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-         font-size:.82rem;line-height:1.6;white-space:pre-wrap;word-break:break-word}
-  .ln{padding:1px 6px;border-radius:4px}
-  .ln.plan{background:rgba(227,179,65,.13);border-left:3px solid var(--gold);
-           color:#f4e3b2;font-weight:600;margin:8px 0 2px}
-  .ln.pstep{color:#cdb877;padding-left:26px}
-  .ln.tool{color:var(--teal)}
-  .ln.sep{color:var(--violet);font-weight:600}
-  .ln.key{color:var(--green);font-weight:600}
-  .ln.warn{color:var(--red)}
-  .resgrid{display:grid;grid-template-columns:1fr;gap:14px;margin-top:14px}
-  @media(min-width:860px){.resgrid{grid-template-columns:1fr 1fr}}
-  .res{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
-  .res h3{margin:0 0 6px;font-size:.98rem;color:var(--accent)}
-  .res pre{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem;
-           white-space:pre-wrap;word-break:break-word;color:#cdd6e0}
-  .res .hl{color:var(--gold);font-weight:600}
-  footer{margin-top:30px;color:var(--muted);font-size:.82rem;border-top:1px solid var(--line);padding-top:14px}
-  kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:.85em}
-</style>
-</head>
-<body>
-<div class="wrap">
+sys.path.insert(0, str(HERE))
+import demo as DEMO  # the tested artifact: imported, never modified
 
-<header class="hero">
-  <h1><span class="gg">GameGuard AI</span> &mdash; live demo</h1>
-  <p class="tag">&ldquo;Detect harmful behavior. Investigate the context. Protect the community.&rdquo;</p>
-  <span class="badge">BattleSphere is a fictional gaming company &mdash; all players, messages and cases are synthetic</span>
-</header>
+COND_RE = re.compile(
+    r"(type 2 diabetes|type 1 diabetes|diabetes|hypertension|high blood pressure|"
+    r"kidney disease|ckd|heart disease|depression|asthma|arthritis|copd|hyperlipidemia)"
+)
 
-<section class="card story">
-  <h2>The story (60 seconds)</h2>
-  <p>BattleSphere has millions of players and a few dozen human moderators. The old safety
-  tool was a keyword filter: it flagged the word &ldquo;password&rdquo; wherever it appeared
-  &mdash; including in the message <em>warning</em> others about a password scam &mdash; and it missed
-  the actual scammer, because he never said anything offensive. He said <strong>&ldquo;FREE gems&quot;</strong>,
-  then <strong>&ldquo;send me your password&quot;</strong>, in three friendly messages spread across an afternoon.</p>
-  <p><strong>GameGuard does NOT flag offensive words.</strong> It understands context, emojis, coded
-  language, and patterns that emerge <strong>across multiple conversations</strong> &mdash; then builds a
-  structured evidence case for the right human team. It never declares guilt. It never suspends
-  anyone. It investigates; people decide.</p>
-  <p>Press <strong>Run live demo</strong>: the orchestrator plans, calls its nine tools, and walks three
-  scenarios &mdash; an account scam, a slow child-safety escalation, and a false-positive that wasn&rsquo;t.</p>
-</section>
+def _capture_canned():
+    """Run the canned demo exactly as before (subprocess), capture stdout."""
+    proc = subprocess.run(
+        [sys.executable, str(DEMO_PY)],
+        cwd=str(HERE),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    return proc.stdout or proc.stderr
 
-<div class="controls">
-  <button id="run" onclick="runDemo()">Run live demo</button>
-  <div class="spinner" id="spin"></div>
-  <div class="status" id="status">Idle &mdash; demo runs locally via <kbd>python3 demo.py</kbd> (stdlib only, offline, deterministic).</div>
-</div>
-
-<div class="panels" id="panels">
-  <section class="card">
-    <h2>Agent trace &mdash; plan + tool calls</h2>
-    <p style="color:var(--muted);font-size:.9rem;margin:0 0 10px">
-      Watch the orchestrator <span style="color:var(--gold);font-weight:600">plan</span> before it acts,
-      then call its <span style="color:var(--teal)">tools</span> message by message.</p>
-    <div class="trace" id="trace"></div>
-  </section>
-  <section class="card">
-    <h2>Results</h2>
-    <div class="resgrid" id="results"></div>
-  </section>
-</div>
-
-<footer>
-  Local demo &mdash; <kbd>python3 app.py</kbd> serves this page from 127.0.0.1 only. No data leaves your machine.
-</footer>
-</div>
-
-<script>
-const traceEl = document.getElementById("trace");
-const resultsEl = document.getElementById("results");
-const panelsEl = document.getElementById("panels");
-const statusEl = document.getElementById("status");
-const runBtn = document.getElementById("run");
-const spinEl = document.getElementById("spin");
-
-function lineClass(line){
-  if (/\[GameGuard Orchestrator PLAN\]/.test(line)) return "plan";
-  if (/^\s{2,}\d+\.\s/.test(line)) return "pstep";
-  if (/\[tool\]/.test(line)) return "tool";
-  if (/^=+/.test(line)) return "sep";
-  if (/>>>\s*OUTCOME|KEY POINT|SESSION SUMMARY/.test(line)) return "key";
-  if (/ESCALATED|Case GG-/.test(line)) return "key";
-  return "";
-}
-
-function renderTrace(text){
-  traceEl.textContent = "";
-  const frag = document.createDocumentFragment();
-  for (const line of text.split("\n")){
-    const div = document.createElement("div");
-    div.className = "ln " + lineClass(line);
-    div.textContent = line === "" ? "\u00a0" : line;
-    frag.appendChild(div);
-  }
-  traceEl.appendChild(frag);
-  traceEl.scrollTop = 0;
-}
-
-function sliceBetween(lines, startRe, endRe){
-  const out = []; let on = false;
-  for (const l of lines){
-    if (!on && startRe.test(l)) on = true;
-    if (on){ out.push(l); if (endRe.test(l) && out.length > 1) break; }
-  }
-  return out.join("\n").trim();
-}
-
-function renderResults(text){
-  resultsEl.textContent = "";
-  const lines = text.split("\n");
-  const cards = [
-    ["Demo 1 \u2014 the account scam",
-     sliceBetween(lines, /DEMO 1/, /KEY POINT[\\s\\S]*$/).split(">>> OUTCOME").slice(1).join(">>> OUTCOME") || ""],
-    ["Demo 2 \u2014 the slow escalation",
-     sliceBetween(lines, /DEMO 2/, /KEY POINT[\\s\\S]*$/).split(">>> OUTCOME").slice(1).join(">>> OUTCOME") || ""],
-    ["Demo 3 \u2014 the false positive that wasn\u2019t",
-     sliceBetween(lines, /DEMO 3/, /KEY POINT[\\s\\S]*$/).split(">>> OUTCOME").slice(1).join(">>> OUTCOME") || ""],
-  ];
-  const evalLines = lines.filter(l =>
-    /Test set:|precision:|evidence quality:|PATTERN TIMING|violating conversations|benign conversations|recall=/.test(l)
-  ).slice(0, 24).join("\n");
-  cards.push(["Evaluation \u2014 1,000 labeled messages + pattern timing", evalLines]);
-  const sess = sliceBetween(lines, /SESSION SUMMARY/, /That is the whole design\\./);
-  cards.push(["Session summary", sess]);
-
-  for (const [title, body] of cards){
-    const card = document.createElement("div");
-    card.className = "res";
-    const h = document.createElement("h3"); h.textContent = title;
-    const pre = document.createElement("pre");
-    pre.textContent = body || "(could not extract \u2014 see trace)";
-    card.appendChild(h); card.appendChild(pre);
-    resultsEl.appendChild(card);
-  }
-}
-
-async function runDemo(){
-  runBtn.disabled = true;
-  spinEl.style.display = "inline-block";
-  panelsEl.classList.remove("show");
-  traceEl.textContent = ""; resultsEl.textContent = "";
-  statusEl.textContent = "Running demo.py \u2014 the orchestrator is planning, calling tools, and investigating\u2026";
-  try{
-    const resp = await fetch("/api/run");
-    if (!resp.ok) throw new Error("server returned HTTP " + resp.status);
-    const data = await resp.json();
-    if (!data.ok) throw new Error(data.error || "demo failed");
-    renderTrace(data.output);
-    renderResults(data.output);
-    panelsEl.classList.add("show");
-    statusEl.textContent = "Done \u2014 " + (data.output.match(/\\[tool\\]/g) || []).length +
-      " tool calls, " + (data.output.match(/Case GG-/g) || []).filter((v,i,a)=>a.indexOf(v)===i).length +
-      " cases opened. See the trace above.";
-  }catch(e){
-    statusEl.textContent = "Error: " + e.message;
-  }finally{
-    runBtn.disabled = false;
-    spinEl.style.display = "none";
-  }
-}
-</script>
-</body>
-</html>
-"""
-
-RUNNING_BANNER = [
-    "Checking the orchestrator's plan...",
-    "Running detect_language on every message...",
-    "Aggregating patterns across conversations...",
-    "Opening cases and building evidence...",
-    "Computing evaluation metrics...",
-]
-
-
-def run_demo_subprocess() -> dict:
-    """Run demo.py in a subprocess (its behavior is never modified here)."""
+def _capture_fn(fn, params):
+    buf = io.StringIO()
     try:
-        proc = subprocess.run(
-            [sys.executable, "demo.py"],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "demo.py timed out after 600s"}
-    except FileNotFoundError as e:
-        return {"ok": False, "error": f"demo.py not found: {e}"}
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "error": f"demo.py exited with code {proc.returncode}",
-            "output": proc.stdout,
-            "stderr": proc.stderr,
-        }
-    return {"ok": True, "output": proc.stdout}
+        with contextlib.redirect_stdout(buf):
+            return fn(params)
+    except Exception as exc:  # never crash the page on a bad input
+        return "[web-ui] The personalized run hit an error and stopped safely.\n%s: %s" % (type(exc).__name__, exc)
 
+# ---- personalized run: input handling lives in app.py; demo.py untouched ----
+
+def run_custom(params):
+    text = (params.get("text") or "").strip()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        if text:
+            print("YOUR MESSAGE:", text)
+            lang = DEMO.detect_language(text)
+            lang_name = lang.get("language", lang) if isinstance(lang, dict) else lang
+            print("Detected language:", lang_name)
+            result = DEMO.classify_message(text, lang, [])
+            scores = result.get("scores", result) if isinstance(result, dict) else {}
+            print("Classifier scores (per category, with escalation threshold):")
+            escalated = False
+            for k, v in scores.items():
+                thr = DEMO.ESCALATE_AT.get(k)
+                try:
+                    flag = v >= thr
+                except TypeError:
+                    flag = False
+                escalated = escalated or flag
+                print("  %-18s %.2f  (escalates at %.2f)%s" % (k, v, thr, "  <-- ESCALATE" if flag else ""))
+            if escalated:
+                print("Verdict: a case file would be opened for a HUMAN moderator -- the agent never suspends anyone.")
+            else:
+                print("Verdict: no escalation. A safety system is judged by what it does not flag, too.")
+        else:
+            scen = (params.get("scenario") or "demo1").strip()
+            fn = {"demo1": DEMO.demo1, "demo2": DEMO.demo2, "demo3": DEMO.demo3}.get(scen, DEMO.demo1)
+            print("RE-RUN: %s (same code path as the canned demo)" % scen)
+            print()
+            fn()
+    return out.getvalue()
+
+PAGE = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>GameGuard AI &mdash; Live Demo</title>\n<style>\n:root{\n  --bg:#0b1220; --bg2:#0e1626; --panel:#131e33; --panel2:#182742;\n  --ink:#eaf0f9; --muted:#9db0c9; --faint:#6b7f99;\n  --teal:#2dd4bf; --teal-dim:rgba(45,212,191,.12);\n  --accent:#5aa9ff; --warn:#fbbf24; --danger:#f87171; --ok:#34d399;\n  --line:#233451; --radius:14px;\n}\n*{box-sizing:border-box}\nbody{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;\n  background:var(--bg);color:var(--ink);line-height:1.6}\nheader{background:linear-gradient(135deg,#0a2540 0%,#0e3a5c 60%,#0b4f4a 100%);\n  padding:42px 32px 34px;border-bottom:1px solid var(--line)}\n.wrap{max-width:1060px;margin:0 auto}\nheader h1{margin:0 0 8px;font-size:30px;letter-spacing:-.01em}\nheader .sub{margin:0;color:#c8d6ea;font-size:16px;max-width:800px}\n.badge{display:inline-block;margin-top:14px;font-size:11.5px;letter-spacing:.1em;\n  text-transform:uppercase;color:#06281f;background:var(--teal);\n  padding:5px 14px;border-radius:999px;font-weight:800}\nmain{padding:8px 32px 48px}\nsection.card{background:var(--panel);border:1px solid var(--line);\n  border-radius:var(--radius);padding:26px 28px;margin:26px 0}\nsection.card h2{margin:0 0 12px;font-size:18px;color:var(--teal)}\nsection.card h2 .n{display:inline-block;width:28px;height:28px;border-radius:50%;\n  background:var(--teal-dim);border:1px solid var(--teal);color:var(--teal);\n  text-align:center;line-height:26px;font-size:14px;margin-right:10px}\nsection.card p{margin:0 0 12px;color:#d5e0f1;font-size:15.5px}\nsection.card p:last-child{margin-bottom:0}\n.watch{list-style:none;margin:6px 0 0;padding:0}\n.watch li{position:relative;padding:8px 0 8px 30px;color:#d5e0f1;font-size:15px;\n  border-bottom:1px dashed var(--line)}\n.watch li:last-child{border-bottom:0}\n.watch li::before{content:"\\25b8";position:absolute;left:8px;color:var(--teal);font-weight:700}\nlabel.f{display:block;margin:14px 0 6px;font-size:13px;font-weight:700;\n  letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}\ninput[type=text],input[type=number],select,textarea{\n  width:100%;background:var(--bg2);border:1px solid var(--line);color:var(--ink);\n  border-radius:10px;padding:11px 14px;font-size:15px;font-family:inherit}\ntextarea{min-height:76px;resize:vertical}\ninput:focus,select:focus,textarea:focus{outline:none;border-color:var(--teal)}\n.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n@media(max-width:700px){.row2{grid-template-columns:1fr}}\n.btnrow{display:flex;gap:14px;align-items:center;margin-top:20px;flex-wrap:wrap}\nbutton.run{background:linear-gradient(135deg,#14b8a6,#0d9488);border:0;\n  color:#04211c;font-weight:800;font-size:17px;padding:15px 34px;\n  border-radius:12px;cursor:pointer;box-shadow:0 6px 22px rgba(45,212,191,.25)}\nbutton.run:hover{filter:brightness(1.08)}\nbutton.run:disabled{opacity:.45;cursor:default;box-shadow:none}\nbutton.ghost{background:transparent;border:1px solid var(--teal);color:var(--teal);\n  font-weight:700;font-size:15px;padding:13px 26px;border-radius:12px;cursor:pointer}\nbutton.ghost:hover{background:var(--teal-dim)}\nbutton.ghost:disabled{opacity:.45;cursor:default}\n.hint{color:var(--muted);font-size:13.5px}\n.spinner{display:none;align-items:center;gap:10px;color:var(--muted);font-size:14px;margin-top:14px}\n.spinner.show{display:flex}\n.dot{width:12px;height:12px;border-radius:50%;background:var(--teal);\n  animation:pulse 1s infinite ease-in-out}\n@keyframes pulse{0%,100%{transform:scale(.6);opacity:.5}50%{transform:scale(1.2);opacity:1}}\n#output{display:none;margin-top:6px}\n#output.show{display:block}\n.out{background:#0a0f1c;border:1px solid var(--line);border-radius:12px;\n  padding:20px 22px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\n  font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;\n  max-height:640px;overflow:auto;color:#c9d6ea}\n.sechead{color:var(--accent);font-weight:800;margin:18px 0 2px;font-size:13.5px}\n.sechead:first-child{margin-top:0}\n.seccap{background:var(--teal-dim);border-left:3px solid var(--teal);\n  padding:8px 12px;margin:4px 0 12px;border-radius:0 8px 8px 0;\n  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;\n  font-size:13.5px;color:#bfe9e2}\n.tok-orch{color:var(--accent);font-weight:700}\n.tok-tool{color:var(--ok);font-weight:700}\n.tok-guard{color:var(--warn);font-weight:700}\n.tok-mem{color:#c084fc;font-weight:700}\n#takeaways{display:none}\n#takeaways.show{display:block}\n.take{background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.4);\n  border-radius:var(--radius);padding:22px 26px;margin:26px 0}\n.take h2{color:var(--ok);margin:0 0 10px;font-size:18px}\n.take ul{margin:0;padding-left:20px}\n.take li{margin:8px 0;color:#d5e0f1;font-size:15px}\ntable.dec{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}\ntable.dec th{background:var(--panel2);color:var(--teal);text-align:left;\n  padding:10px 12px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;\n  border-bottom:1px solid var(--line)}\ntable.dec td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}\n.pill{display:inline-block;padding:3px 12px;border-radius:999px;font-weight:800;font-size:12px}\n.pill.v{background:var(--ok);color:#04281c}\n.pill.s{background:var(--faint);color:#0b1220}\nfooter{padding:26px 32px 40px;color:var(--faint);font-size:13.5px;text-align:center}\nfooter a{color:var(--teal);text-decoration:none}\nfooter a:hover{text-decoration:underline}\ndetails.raw{margin-top:14px}\ndetails.raw summary{cursor:pointer;color:var(--muted);font-size:13.5px}\n</style>\n</head>\n<body>\n<header><div class="wrap">\n  <h1>GameGuard AI</h1>\n  <p class="sub">It doesn\'t flag bad words. It understands conversations — across languages, emojis, and time.</p>\n  <span class="badge">DEMO 7 OF 8 · AGENTIC AI WORKSHOP</span>\n</div></header>\n<main><div class="wrap">\n\n<section class="card" id="story">\n  <h2><span class="n">1</span>The story</h2>\n  <p>BattleSphere has millions of players and a few dozen human moderators. The old safety tool was a keyword filter: it flagged the word <i>"password"</i> wherever it appeared — including when a player <i>warned</i> others about a scam — and missed the actual scammer, who never said anything offensive.</p>\n<p>GameGuard is the agent that replaced it. It reads conversations across English, Spanish, and Hindi, interprets emojis <i>in context</i>, watches how interactions develop over multiple messages, correlates chat with transaction history — and builds an evidence case for a human moderator. <b>It never declares guilt. It never suspends anyone. It investigates; people decide.</b></p>\n</section>\n\n<section class="card" id="watch">\n  <h2><span class="n">2</span>What to watch for</h2>\n  <ul class="watch">\n<li>Demo 1: three friendly messages — free gems, then “send me your password.” Watch the pattern assemble into a case.</li>\n<li>Demo 2: nothing alarming in any single message. Watch the risk score climb as the pattern develops across sessions.</li>\n<li>Demo 3: slang, emojis, trash talk — and the agent correctly does NOTHING. A safety system is judged by what it doesn\'t flag, too.</li>\n<li>The evaluation: precision, recall, and false-positive rates per language and category — no single accuracy score.</li>\n  </ul>\n</section>\n\n\n\n<section class="card" id="tryown">\n  <h2><span class="n">✎</span>Try your own</h2>\n  <p>Run the classifier on <b>your own text</b> — or re-run one of the three canned scenarios.</p>\n  <label class="f" for="g_scen">Scenario</label>\n  <select id="g_scen">\n    <option value="demo1">Demo 1 — the account scam</option>\n    <option value="demo2">Demo 2 — the slow escalation</option>\n    <option value="demo3">Demo 3 — the false positive that wasn\'t</option>\n  </select>\n  <label class="f" for="g_text">…or paste your own message</label>\n  <textarea id="g_text" placeholder="e.g. hey I\'ll send you free gems, just need your login"></textarea>\n  <div class="btnrow">\n    <button class="ghost" id="customRun">Run the classifier</button>\n    <span class="hint">Same inputs → same output. Deterministic.</span>\n  </div>\n  <div class="spinner" id="cspin"><div class="dot"></div>Scoring the message…</div>\n</section>\n\n\n<section class="card" id="runbox">\n  <h2><span class="n">3</span>Run the demo</h2>\n  <p>Click below to run the full canned demonstration. It takes a few seconds.</p>\n  <div class="btnrow">\n    <button class="run" id="run">&#9654; Run live demo</button>\n  </div>\n  <div class="spinner" id="spin"><div class="dot"></div><span>The agent is investigating the conversations…</span></div>\n  <div id="output">\n    <div class="out" id="outtext"></div>\n    <details class="raw"><summary>Show raw terminal output</summary>\n      <div class="out" id="rawtext"></div>\n    </details>\n  </div>\n</section>\n\n<section class="card" id="takeaways" style="display:none">\n  <div class="take">\n    <h2>What just happened</h2>\n    <ul>\n<li>A lure alone never escalates: free gems only become actionable paired with a credential or payment request.</li>\n<li>Context beats keywords: the filter-era false positive — flagging a scam <i>warning</i> — can\'t happen here.</li>\n<li>Demo 3 is the point: restraint is a feature. Flag-everything systems drown moderators.</li>\n<li>Thresholds encode values: child-safety escalates at a lower score because missing it is catastrophic.</li>\n<li>Try your own: paste any message in “Try your own” and watch the classifier score it.</li>\n    </ul>\n  </div>\n</section>\n\n</div></main>\n<footer><div class="wrap">\n  <a href="https://github.com/ynpreet/gameguard-ai" target="_blank" rel="noopener">View the project on GitHub</a>\n  &nbsp;&middot;&nbsp; All data in this demo is synthetic / fictional.\n</div></footer>\n\n<script>\nconst SECTIONS = [["DEMO 1", "The account scam: harmless gifts turn into a credential trap. Evidence assembled, case opened for a human."], ["DEMO 2", "The slow escalation: risk assessed across messages, never from one. Child-safety thresholds are deliberately lower."], ["DEMO 3", "The false positive that wasn\'t: slang and emojis, correctly left alone. Moderator trust intact."], ["EVALUATION", "1,000 labeled messages: precision, recall, false positives \\u2014 per language, per category."], ["SESSION SUMMARY", "End of run."]];\nfunction esc(s){return s.replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\');}\nfunction decorate(line){\n  let h = esc(line);\n  h = h.replace(/\\[ORCHESTRATOR\\]/g,\'<span class="tok-orch">[ORCHESTRATOR]</span>\');\n  h = h.replace(/\\[TOOL [^\\]]+\\]/g,function(m){return \'<span class="tok-tool">\'+m+\'</span>\';});\n  h = h.replace(/\\[MEMORY\\]/g,\'<span class="tok-mem">[MEMORY]</span>\');\n  h = h.replace(/GUARDRAIL/g,\'<span class="tok-guard">GUARDRAIL</span>\');\n  return h;\n}\nfunction renderOut(text){\n  document.getElementById(\'rawtext\').textContent = text;\n  const lines = text.split(\'\\n\');\n  let html = \'\';\n  for(const line of lines){\n    let matched = null;\n    for(const s of SECTIONS){ if(line.indexOf(s.m) !== -1){ matched = s; break; } }\n    if(matched){\n      html += \'<div class="sechead">\'+decorate(line)+\'</div>\'+\n              \'<div class="seccap">\'+matched.c+\'</div>\';\n      continue;\n    }\n    html += decorate(line) + \'\\n\';\n  }\n  document.getElementById(\'outtext\').innerHTML = html;\n  document.getElementById(\'output\').classList.add(\'show\');\n  document.getElementById(\'output\').scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\nfunction showTakeaways(){\n  const t = document.getElementById(\'takeaways\');\n  t.style.display=\'block\'; t.classList.add(\'show\');\n  t.scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\ndocument.getElementById(\'run\').addEventListener(\'click\',function(){\n  const btn=this, spin=document.getElementById(\'spin\');\n  btn.disabled=true; spin.classList.add(\'show\');\n  fetch(\'/api/run\').then(r=>r.json()).then(j=>{\n    spin.classList.remove(\'show\'); btn.disabled=false;\n    renderOut(j.output);\n    if(typeof loadDecisionTable===\'function\') loadDecisionTable();\n    showTakeaways();\n  }).catch(e=>{spin.classList.remove(\'show\');btn.disabled=false;alert(\'Run failed: \'+e);});\n});\n\nfunction collectCustom(){\n  return {scenario:document.getElementById(\'g_scen\').value,\n          text:document.getElementById(\'g_text\').value};\n}\n\nfunction wireCustom(){\n  const b=document.getElementById(\'customRun\');\n  if(!b) return;\n  b.addEventListener(\'click\',function(){\n    const spin=document.getElementById(\'cspin\');\n    b.disabled=true; spin.classList.add(\'show\');\n    fetch(\'/api/custom\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n      body:JSON.stringify(collectCustom())})\n    .then(r=>r.json()).then(j=>{\n      spin.classList.remove(\'show\'); b.disabled=false;\n      if(j.error){alert(j.error);return;}\n      renderOut(j.output); showTakeaways();\n    }).catch(e=>{spin.classList.remove(\'show\');b.disabled=false;alert(\'Run failed: \'+e);});\n  });\n}\nwireCustom();\n</script>\n</body>\n</html>\n'
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "GameGuardUI/1.0"
+    server_version = "WorkshopUI/1.0"
 
-    def log_message(self, fmt, *args):  # keep server logs readable
-        sys.stderr.write(f"[{self.address_string()}] {fmt % args}\n")
-
-    def _send(self, code: int, body: bytes, ctype: str):
-        self.send_response(code)
+    def _send(self, body, ctype="text/html; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(data)
+
+    def _json(self, obj):
+        self._send(json.dumps(obj), "application/json; charset=utf-8")
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path = urllib.parse.urlsplit(self.path).path
         if path in ("/", "/index.html"):
-            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            self._send(PAGE)
         elif path == "/api/run":
-            result = run_demo_subprocess()
-            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
-            self._send(200, body, "application/json; charset=utf-8")
+            self._json({"output": _capture_canned()})
         else:
-            self._send(404, b'{"ok": false, "error": "not found"}',
-                       "application/json; charset=utf-8")
+            self.send_error(404, "not found")
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/custom":
+            params = self._read_json()
+            self._json({"output": _capture_fn(run_custom, params)})
+        else:
+            self.send_error(404, "not found")
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("ui: " + (fmt % args) + "\n")
 
 
-def main() -> int:
+def main():
+    server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    print("GameGuard AI demo UI -> http://localhost:8007")
+    print("Press Ctrl-C to stop.")
     try:
-        httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
-    except OSError as e:
-        if e.errno == errno.EADDRINUSE:
-            print(f"ERROR: port {PORT} is already in use.", file=sys.stderr)
-            print(f"Another process is already listening on {HOST}:{PORT} "
-                  f"(maybe an earlier 'python3 app.py' is still running).", file=sys.stderr)
-            print(f"Stop it first — find the PID with  lsof -ti:{PORT}  and "
-                  f"kill <PID>, then run 'python3 app.py' again.", file=sys.stderr)
-            return 1
-        raise
-    print("=" * 62)
-    print("  GameGuard AI — live web demo (stdlib only, offline)")
-    print(f"  Open in Chrome: http://localhost:{PORT}")
-    print("=" * 62)
-    sys.stdout.flush()
-    try:
-        httpd.serve_forever()
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down.")
-    return 0
+        print("\nstopped.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
