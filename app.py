@@ -118,7 +118,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             length = 0
         raw = self.rfile.read(length) if length else b"{}"
-        return json.loads(raw.decode("utf-8") or "{}")
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return {}
 
     def _serve_asset(self, path):
         safe = (HERE / path.lstrip("/")).resolve()

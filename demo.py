@@ -37,6 +37,7 @@ plan and each tool call before executing it.
 """
 
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -122,6 +123,33 @@ EMOJI_MEANINGS = {
     "😂": {"neutral": "laughter", "risk_ctx": "harmless (context-dependent)"},
 }
 
+# Leetspeak normalization: scammers write "fr33 g3ms" to dodge keyword
+# filters. We normalize a COPY for matching only -- the original text is
+# never altered in logs or evidence. Deterministic, stdlib only.
+_LEET_MAP = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a",
+                           "5": "s", "7": "t", "$": "s", "@": "a"})
+
+
+def _normalize_leetspeak(text: str) -> str:
+    return text.translate(_LEET_MAP)
+
+
+def _marker_hit(haystack: str, marker: str) -> bool:
+    """Match a marker against text.
+
+    Phrases (contain a space) and long tokens: substring match.
+    Short tokens (<=4 chars): leading word-boundary match, so "gem" still
+    catches "gems" but emoji and short tokens don't misfire. Emoji and
+    other non-word tokens: substring match (\\b doesn't work on them).
+    """
+    if not marker:
+        return False
+    if " " in marker or len(marker) > 4:
+        return marker in haystack
+    if re.search(r"\w", marker) is None:
+        return marker in haystack
+    return re.search(r"\b" + re.escape(marker) + r"\w*", haystack) is not None
+
 
 def classify_message(text: str, language: str, conversation_history: Optional[List[str]] = None) -> Dict:
     """Classify a message. Returns suspicions as HYPOTHESES, never verdicts.
@@ -133,25 +161,69 @@ def classify_message(text: str, language: str, conversation_history: Optional[Li
     t = text.lower()
     history = " ".join(conversation_history or []).lower()
     combined = history + " " + t
+    # Leetspeak-normalized copies for matching ("fr33 g3ms" -> "free gems").
+    tn = _normalize_leetspeak(t)
+    combined_n = _normalize_leetspeak(combined)
 
-    lure_markers = ["free", "gratis", "मुफ्त", "gem", "रत्न", "💎", "🎁", "giveaway"]
-    cred_markers = ["password", "contraseña", "पासवर्ड", "cuenta", "खाता",
-                    "🔑", "login", "account details", "2fa"]
-    fraud_markers = ["buy my", "sell you", "for $", "venmo", "paypal", "cashapp"]
-    info_req_markers = ["how old are you", "where do you live", "what school",
-                        "phone number", "cuántos años", "उम्र"]
-    secrecy_markers = ["don't tell", "keep it secret", "no le digas", "🤫", "our secret"]
-    offplat_markers = ["whatsapp", "snapchat", "discord dm", "text me", "📱", "call me"]
+    lure_markers = ["free", "gratis", "मुफ्त", "gem", "रत्न", "💎", "🎁", "giveaway",
+                    "doubler", "double your", "click the link", "bit.ly", "tinyurl",
+                    "claim now", "limited offer"]
+    cred_markers = ["password", "contraseña", "पासवर्ड", "cuenta", "tu cuenta",
+                    "खाता", "खाता विवरण", "🔑", "login", "login details",
+                    "account details", "your account", "2fa", "2fa code",
+                    "verification code", "otp", "send your", "send password",
+                    "enter your", "give me your", "send me"]
+    fraud_markers = ["buy my", "sell you", "for $", "venmo", "paypal", "cashapp",
+                     "cash app", "zelle", "crypto", "gift card", "steam card"]
+    info_req_markers = ["how old are you", "how old r u", "how old r you",
+                        "whats your age", "what's your age", "ur age", "your age",
+                        "where do you live", "where u live", "where do u live",
+                        "what school", "phone number", "cuántos años", "उम्र",
+                        "send pic", "send a pic", "pic of you", "send photo"]
+    # Compliment + personal question in one message is the classic grooming
+    # opener ("u seem nice, how old r u"). Either alone is weak; together
+    # they are the pattern.
+    compliment_markers = ["u seem nice", "you seem nice", "ur cute", "you're cute",
+                          "you are cute", "u r cute", "pretty", "handsome"]
+    secrecy_markers = ["don't tell", "dont tell", "keep it secret", "no le digas",
+                       "🤫", "our secret", "between us", "our little secret",
+                       "don't tell anyone", "dont tell anyone"]
+    offplat_markers = ["whatsapp", "snapchat", "discord dm", "text me", "📱",
+                       "call me", "dm me", "message me", "snap", "insta",
+                       "instagram", "telegram"]
+    # Warning ABOUT a scam ("don't fall for the free gems scam") and jokes
+    # ("my password is hunter2 lol jk") look keyword-similar to real attacks.
+    # Context dampens the score -- this is the anti-false-positive layer.
+    warning_markers = ["don't fall for", "dont fall for", "beware", "scam alert",
+                       "stay safe", "don't click", "dont click", "report him",
+                       "report them", "it's a scam", "its a scam", "psa",
+                       "mods will never", "will never ask"]
+    joke_markers = ["lol jk", " jk", "just kidding", "joking", "/s"]
 
-    lure = sum(1 for m in lure_markers if m in combined)
-    cred = sum(1 for m in cred_markers if m in combined)
+    def hits(markers, *haystacks):
+        return sum(1 for m in markers
+                   if any(_marker_hit(h, m) for h in haystacks))
+
+    lure = hits(lure_markers, combined, combined_n)
+    cred = hits(cred_markers, combined, combined_n)
     # The lure half is capped: a lure ALONE can never escalate. It needs the
     # credential/payment half of the pattern before a case opens.
     scam = min(1.0, min(lure * 0.15, 0.6) + cred * 0.5)
-    fraud = min(1.0, sum(1 for m in fraud_markers if m in t) * 0.5)
-    risk = min(1.0, sum(1 for m in info_req_markers if m in combined) * 0.2
-               + sum(1 for m in secrecy_markers if m in combined) * 0.35
-               + sum(1 for m in offplat_markers if m in combined) * 0.35)
+    # Anti-false-positive layer: warning others about a scam, or joking about
+    # your own password, is not an attack. Context dampens the score.
+    if hits(warning_markers, combined, combined_n):
+        scam *= 0.4
+    if hits(joke_markers, combined, combined_n):
+        scam *= 0.5
+    fraud = min(1.0, hits(fraud_markers, t, tn) * 0.5)
+    info = hits(info_req_markers, combined, combined_n)
+    compliment = hits(compliment_markers, combined, combined_n)
+    # Two personal questions in ONE message is aggressive harvesting even
+    # without secrecy/off-platform signals -- each counts 0.25 now.
+    risk = min(1.0, info * 0.25
+               + (0.35 if (info and compliment) else 0.0)  # grooming opener
+               + hits(secrecy_markers, combined, combined_n) * 0.35
+               + hits(offplat_markers, combined, combined_n) * 0.35)
 
     scores = {"scam": scam, "marketplace_fraud": fraud,
               "child_safety_risk": risk, "toxicity": 0.0}
@@ -498,6 +570,10 @@ def build_labeled_set() -> List[Dict]:
         "giveaway!! free gems, my password is hunter2 lol jk",
         " PSA: nobody legit will ask for your password, stay safe ",
         "I wish gems were free, mine cost me twenty bucks 😅",
+        "that 'free gems' DM is a scam, report don't click",
+        "lol he asked for my password so I sent him a recipe",
+        "my little brother fell for the gem doubler, warn your friends",
+        "PSA: mods will NEVER dm you for login details",
     ]
     benign_es = [
         "jajaja buena jugada 😂", "gracias por la partida amigo", "nos vemos mañana",
@@ -511,6 +587,9 @@ def build_labeled_set() -> List[Dict]:
         "FREE gems for new players! 🎁 just send your password 🔑",
         "I'm giving away free 💎💎, login details needed",
         "claim your free gift, enter your account password",
+        "fr33 g3ms just send p4ssword",
+        "gem doubler!! send 100 get 200 back, login required",
+        "click the link for free skins, enter 2fa code",
     ]
     scam_es = [
         "gemas GRATIS 🎁 envíame tu contraseña",
@@ -524,6 +603,9 @@ def build_labeled_set() -> List[Dict]:
         "how old are you? where do you live?",
         "don't tell your parents, our secret 🤫",
         "add me on whatsapp so we can talk privately 📱",
+        "u seem nice, how old r u",
+        "you're cute, dont tell anyone, dm me on snap",
+        "between us, send pic of you? our little secret",
     ]
     risk_es = [
         "cuántos años tienes? no le digas a nadie 🤫",
