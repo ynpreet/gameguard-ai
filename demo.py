@@ -198,7 +198,12 @@ def classify_message(text: str, language: str, conversation_history: Optional[Li
     warning_markers = ["don't fall for", "dont fall for", "beware", "scam alert",
                        "stay safe", "don't click", "dont click", "report him",
                        "report them", "it's a scam", "its a scam", "psa",
-                       "mods will never", "will never ask"]
+                       "mods will never", "will never ask",
+                       # anti-scam advice ("never share your password", "fake
+                       # free-gem links", "report the messages") is a WARNING,
+                       # not an attack -- context dampens the score (T5 guard)
+                       "never share", "don't share", "do not share", "fake",
+                       "report the", "warning"]
     joke_markers = ["lol jk", " jk", "just kidding", "joking", "/s"]
 
     def hits(markers, *haystacks):
@@ -255,11 +260,33 @@ def classify_message(text: str, language: str, conversation_history: Optional[Li
         _log("classify_message", {"context": "gaming"},
              "in-game markers present; threat score dampened (trash talk, not a real-world threat)")
 
+    # Reporting context: a player QUOTING harm they received ("a player sent
+    # me '...'"), or making an uncorroborated allegation ("ban them, I have no
+    # screenshots"). A quoted threat must never be attributed to the reporter;
+    # an allegation is a report for human review, never a finding of guilt.
+    report_framing_markers = ["help me report", "report the player", "i feel unsafe",
+                              "feel unsafe", "a player sent me", "someone sent me",
+                              "he sent me", "she sent me", "they sent me",
+                              "sent me this", "someone told me", "a player told me"]
+    allegation_markers = ["is a predator", "is definitely", "ban them", "ban him",
+                          "ban her", "i know they are guilty", "i know he is guilty",
+                          "i know she is guilty", "no screenshots", "no proof",
+                          "i have no evidence"]
+    report_framing = hits(report_framing_markers, combined, combined_n) > 0
+    # Quoted threat: violent language PLUS quoting framing -- the speaker is
+    # the reporter, not the offender. toxicity stays logged (not escalated).
+    quoted_threat = bool(threat) and report_framing
+    allegation = hits(allegation_markers, combined, combined_n) > 0
+
     scores = {"scam": scam, "marketplace_fraud": fraud,
               "child_safety_risk": risk, "toxicity": round(toxicity, 2)}
     _log("classify_message", {"lang": language, "text": text[:36]},
-         f"scores={ {k: round(v, 2) for k, v in scores.items()} }")
+         f"scores={ {k: round(v, 2) for k, v in scores.items()} }"
+         + (" quoted_threat=YES" if quoted_threat else "")
+         + (" allegation=YES" if allegation else ""))
     return {"scores": scores, "language": language,
+            "report_framing": report_framing,
+            "quoted_threat": quoted_threat, "allegation": allegation,
             "emoji_notes": [f"{e}: context-dependent (see conversation)"
                             for e in EMOJI_MEANINGS if e in text]}
 
@@ -449,6 +476,50 @@ class GameGuardAgent:
                     case = open_case
                 result.update({"escalated": True, "case": case})
         self._flush_tools()
+        if not result["escalated"] and (other == "MOD-REPORT" or cls.get("report_framing")):
+            # Player reports that don't cross a signal threshold still need a
+            # review workflow: a quoted threat is attributed to the UNKNOWN
+            # SENDER (never the reporter) and routed to trust & safety; an
+            # uncorroborated allegation is logged for human review with NO
+            # finding of guilt and no action. Allegation != evidence.
+            report_case = None
+            if cls.get("quoted_threat"):
+                policy = retrieve_safety_policy("toxicity")
+                prio = {"priority": "P2-HIGH",
+                        "routed_to": "trust & safety team, review within 4 hours"}
+                summary = (f"Player REPORT (not a violation by the reporter): {player} quoted a "
+                           f"violent threat sent to them ({text[:60]!r}). The quoted content is "
+                           f"attributed to the UNKNOWN SENDER, not to {player}. ASSESSMENT, not "
+                           f"verdict: needs the sender identified. Requires human review.")
+                evidence = [f"[{ts(step)}] {player} (REPORTER, not offender): {text!r}",
+                            f"Account: {acct['age_days']} days old, {acct['prior_strikes']} prior strikes, "
+                            f"verified={acct['verified']}",
+                            f"Policy {policy['policy_id']} ({policy['title']}): {policy['description']}"]
+            elif cls.get("allegation"):
+                policy = retrieve_safety_policy("child_safety")
+                prio = {"priority": "P4-LOW",
+                        "routed_to": "general moderation queue — allegation logged, no action without evidence"}
+                summary = (f"Player REPORT (UNVERIFIED allegation): {player} alleges another player "
+                           f"is a predator and demands an immediate ban, but provides NO evidence "
+                           f"({text[:60]!r}). ALLEGATION != EVIDENCE: no finding of guilt, no action. "
+                           f"Logged for human review only.")
+                evidence = [f"[{ts(step)}] {player} (REPORTER): {text!r}",
+                            f"Policy {policy['policy_id']} ({policy['title']}): {policy['description']}"]
+            else:
+                policy, prio, summary, evidence = None, None, None, None
+            if summary:
+                open_case = next((c for c in CASES
+                                  if set(c["players"]) == {player, other}
+                                  and c["status"].startswith("OPEN")), None)
+                if open_case is None:
+                    report_case = create_moderation_case(summary, evidence, policy, prio, [player, other])
+                else:
+                    open_case["evidence"].extend(
+                        e for e in evidence if e not in open_case["evidence"])
+                    _log("create_moderation_case", {"summary": "(player report, case already open)"},
+                         f"appended report evidence to {open_case['case_id']}")
+                    report_case = open_case
+                result.update({"escalated": True, "case": report_case})
         return result
 
 
